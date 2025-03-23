@@ -3,161 +3,211 @@
 //
 
 #include "hashmap.h"
+#include <stdlib.h>
+#include <string.h>
 
-HashMap* createHashMap() {
-    HashMap* map = (HashMap*) malloc(sizeof(HashMap));
-    if (map == NULL) return NULL;
+#define INITIAL_CAPACITY 16
+#define MAX_LOAD_FACTOR 0.75f
 
-    map->size = INITIAL_HASHMAP_SIZE;
-    map->buckets = calloc(map->size, sizeof(HashNode*));
-    if(!map->buckets) {
+// MurmurHash2 implementation
+static uint32_t murmurhash2(const char* key, size_t len) {
+    const uint32_t seed = 0x1BADB002;
+    const uint32_t m = 0x5BD1E995;
+    const int r = 24;
+    uint32_t h = seed ^ len;
+    const unsigned char* data = (const unsigned char*)key;
+    
+    while (len >= 4) {
+        uint32_t k = *(uint32_t*)data;
+        k *= m;
+        k ^= k >> r;
+        k *= m;
+        h *= m;
+        h ^= k;
+        data += 4;
+        len -= 4;
+    }
+    
+    switch (len) {
+        case 3: h ^= data[2] << 16;
+        case 2: h ^= data[1] << 8;
+        case 1: h ^= data[0];
+                h *= m;
+    }
+    
+    h ^= h >> 13;
+    h *= m;
+    h ^= h >> 15;
+    
+    return h;
+}
+
+// Hash function
+static size_t hash(const char* key, size_t capacity) {
+    return murmurhash2(key, strlen(key)) % capacity;
+}
+
+// Resize the hashmap
+static void resize(Hashmap* map) {
+    size_t old_capacity = map->capacity;
+    RedisObject** old_buckets = map->buckets;
+    
+    map->capacity *= 2;
+    map->buckets = calloc(map->capacity, sizeof(RedisObject*));
+    if (!map->buckets) {
+        map->capacity = old_capacity;
+        map->buckets = old_buckets;
+        return;
+    }
+    
+    for (size_t i = 0; i < old_capacity; i++) {
+        if (old_buckets[i]) {
+            RedisObject* obj = old_buckets[i];
+            size_t index = hash(obj->key, map->capacity);
+            map->buckets[index] = obj;
+        }
+    }
+    
+    free(old_buckets);
+}
+
+Hashmap* hashmap_create(size_t initial_capacity) {
+    Hashmap* map = malloc(sizeof(Hashmap));
+    if (!map) return NULL;
+    
+    map->capacity = initial_capacity ? initial_capacity : INITIAL_CAPACITY;
+    map->size = 0;
+    map->load_factor = 0.0f;
+    map->buckets = calloc(map->capacity, sizeof(RedisObject*));
+    
+    if (!map->buckets) {
         free(map);
         return NULL;
     }
-
+    
     return map;
 }
 
-unsigned int hashFunction(const char* key, size_t size) {
-    unsigned int h = 0x9747b28c;
-    for (; *key; key++) {
-        h ^= *key;
-        h *= 0x5bd1e995;
-        h ^= h >> 15;
-    }
-    return h % size; 
-}
-
-void hashMapInsert(HashMap* map, const char* key, unsigned char* value, size_t valueSize) {
-    unsigned int index = hashFunction(key, map->size);
-
-    HashNode* newNode = malloc(sizeof(HashNode));
-    if (!newNode) return;
-
-    newNode->value = malloc(valueSize * sizeof(unsigned char));
-    if (!newNode->value) {
-        free(newNode);
-        return;
-    }
-    newNode->key = strdup(key);
-    if (!newNode->key) {
-        free(newNode->value);
-        free(newNode);
-        return;
-    }
-
-    memcpy(newNode->value, value, valueSize);
-
-    newNode->valueSize = valueSize;
-
-    newNode->next = map->buckets[index];
-    map->buckets[index] = newNode;
+void hashmap_destroy(Hashmap* map) {
+    if (!map) return;
     
-    map->itemCount++;
-    if ((double) map->itemCount / map->size > RESIZE_UP_THRESHOLD) {
-        resizeHashMap(map, 2.0);
-    } else if ((double) map->itemCount / map->size < RESIZE_DOWN_THRESHOLD && map->size > INITIAL_HASHMAP_SIZE) {
-        resizeHashMap(map, 0.5);
-    }
-}
-
-void resizeHashMap(HashMap* map, double scale) {
-    size_t newSize = map->size * scale;
-    HashNode** newBuckets = calloc(newSize, sizeof(HashNode*));
-
-    for (size_t i = 0; i < map->size; i++) {
-        HashNode* node = map->buckets[i];
-        while (node) {
-            unsigned int newIndex = hashFunction(node->key, newSize);
-
-            HashNode* next = node->next;
-            node->next = newBuckets[newIndex];
-            newBuckets[newIndex] = node;
-
-            node = next;
+    for (size_t i = 0; i < map->capacity; i++) {
+        if (map->buckets[i]) {
+            freeRedisObject(map->buckets[i]);
         }
     }
-
-    free(map->buckets);
-    map->buckets = newBuckets;
-    map->size = newSize;
-}
-
-
-unsigned char* hashMapGet(HashMap* map, const char* key, size_t* foundSize) {
-    unsigned int index = hashFunction(key, map->size);
-
-    HashNode* fetchedNode = map->buckets[index];
-
-    while(fetchedNode && strcmp(key, fetchedNode->key) != 0) {
-        fetchedNode = fetchedNode->next;
-    }
-
-    if (!fetchedNode) return NULL;
-
-    *foundSize = fetchedNode->valueSize;
-
-    return fetchedNode->value;
-}
-
-void hashMapRemove(HashMap* map, const char* key) {
-    unsigned int index = hashFunction(key, map->size);
-    HashNode* node = map->buckets[index];
-    HashNode* prev = NULL;
-
-    while (node && strcmp(key, node->key) != 0) {
-        prev = node;
-        node = node->next;
-    }
-
-    if (!node) return;
-
-    if (prev) {
-        prev->next = node->next;
-    } else {
-        map->buckets[index] = node->next;
-    }
-
-    free(node->key);
-    free(node->value);
-    free(node);
-
-    map->itemCount--;
-}
-
-void freeHashMap(HashMap* map) {
-    for(int i = 0; i < (int) map->size; i++) {
-        freeBucket(map->buckets[i]);
-    }
+    
     free(map->buckets);
     free(map);
 }
 
-void freeBucket(HashNode* toRemove) {
-    while (toRemove) {
-        HashNode* next = toRemove->next;
-
-        free(toRemove->key);
-        free(toRemove->value);
-        free(toRemove);
-
-        toRemove = next;
+bool hashmap_put(Hashmap* map, const char* key, RedisObject* value) {
+    if (!map || !key || !value) return false;
+    
+    // Check load factor and resize if needed
+    if (map->load_factor >= MAX_LOAD_FACTOR) {
+        resize(map);
     }
+    
+    size_t index = hash(key, map->capacity);
+    
+    // Handle collision by chaining
+    if (map->buckets[index]) {
+        RedisObject* current = map->buckets[index];
+        while (current->next) {
+            if (strcmp(current->key, key) == 0) {
+                // Update existing key
+                freeRedisObject(current);
+                map->buckets[index] = value;
+                value->next = current->next;
+                return true;
+            }
+            current = current->next;
+        }
+        
+        if (strcmp(current->key, key) == 0) {
+            // Update existing key
+            freeRedisObject(current);
+            map->buckets[index] = value;
+            value->next = current->next;
+            return true;
+        }
+        
+        // Add to chain
+        value->next = map->buckets[index];
+        map->buckets[index] = value;
+    } else {
+        map->buckets[index] = value;
+        value->next = NULL;
+    }
+    
+    map->size++;
+    map->load_factor = (float)map->size / map->capacity;
+    return true;
 }
 
-void printHashMap(HashMap* map) {
-    for (int i = 0; i < (int) map->size; i++) {
-        HashNode* node = map->buckets[i];
-        if (node) {
-            printf("Bucket %d:\n", i);
+RedisObject* hashmap_get(Hashmap* map, const char* key) {
+    if (!map || !key) return NULL;
+    
+    size_t index = hash(key, map->capacity);
+    RedisObject* current = map->buckets[index];
+    
+    while (current) {
+        if (strcmp(current->key, key) == 0) {
+            return current;
         }
-        while (node) {
-            printf("  Key: %s, Value: ", node->key);
-            for (size_t j = 0; j < node->valueSize; j++) {
-            printf("%02x ", node->value[j]);
+        current = current->next;
+    }
+    
+    return NULL;
+}
+
+bool hashmap_remove(Hashmap* map, const char* key) {
+    if (!map || !key) return false;
+    
+    size_t index = hash(key, map->capacity);
+    RedisObject* current = map->buckets[index];
+    RedisObject* prev = NULL;
+    
+    while (current) {
+        if (strcmp(current->key, key) == 0) {
+            if (prev) {
+                prev->next = current->next;
+            } else {
+                map->buckets[index] = current->next;
             }
-            printf("\n");
-            node = node->next;
+            
+            freeRedisObject(current);
+            map->size--;
+            map->load_factor = (float)map->size / map->capacity;
+            return true;
+        }
+        
+        prev = current;
+        current = current->next;
+    }
+    
+    return false;
+}
+
+bool hashmap_contains(Hashmap* map, const char* key) {
+    return hashmap_get(map, key) != NULL;
+}
+
+size_t hashmap_size(Hashmap* map) {
+    return map ? map->size : 0;
+}
+
+void hashmap_clear(Hashmap* map) {
+    if (!map) return;
+    
+    for (size_t i = 0; i < map->capacity; i++) {
+        if (map->buckets[i]) {
+            freeRedisObject(map->buckets[i]);
+            map->buckets[i] = NULL;
         }
     }
+    
+    map->size = 0;
+    map->load_factor = 0.0f;
 }
